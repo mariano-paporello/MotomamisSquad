@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+opencv-python-headless
+torch
+paddleocr
+numpy
+pydantic
+torchvision
+matplotlib
+pandas
+seaborn
+python-multipart
+paddlepaddle
