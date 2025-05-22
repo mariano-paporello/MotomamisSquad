@@ -32,7 +32,6 @@ Lista de los requisitos para ejecutar el proyecto:
 
 * Python 3.10 o superior.
 * pip (gestor de paquetes de Python).
-* [Cualquier otra dependencia del sistema operativo o software específico].
 
 ## Instalación
 
