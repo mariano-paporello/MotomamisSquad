@@ -3,6 +3,10 @@ uvicorn[standard]
 opencv-python-headless
 torch
 paddleocr
+paddle
+opencv-python
+ultralytics-thop
+ultralytics
 numpy
 pydantic
 torchvision
@@ -10,4 +14,3 @@ matplotlib
 pandas
 seaborn
 python-multipart
-paddlepaddle
