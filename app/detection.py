@@ -7,16 +7,19 @@ import re
 from pathlib import Path
 from paddleocr import PaddleOCR
 
-# Configurar rutas e imports yolov
-sys.path.insert(0, r'C:\Users\Ginette Henriquez\Downloads\TP\yolov5')
+# --- Configurar rutas ---
+BASE_DIR = Path(__file__).resolve().parent.parent
+YOLOV5_DIR = BASE_DIR / 'yolov5'
+sys.path.insert(0, str(YOLOV5_DIR))  # Agrega yolov5 al sys.path
+
 from models.experimental import attempt_load
 from utils.general import non_max_suppression
 from utils.torch_utils import select_device
 
-# Inicializar OCR y modelo
-ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+# --- Inicializar PaddleOCR con rutas explícitas ---
+ocr = PaddleOCR(use_angle_cls=True, lang='en')
 device = select_device('cpu')
-modelo_path = Path(__file__).resolve().parent.parent / 'model' / 'best_windows_safe.pt'
+modelo_path = BASE_DIR / 'model' / 'best_windows_safe.pt'
 model = attempt_load(str(modelo_path), device)
 model.eval()
 todos_los_resultados = []
@@ -28,8 +31,8 @@ def formatear_patente(texto):
 
 def es_patente_valida(txt):
     return bool(
-        re.match(r'^[A-Z]{3}\d{3}$', txt) or         # ABC123 1995 A 2016
-        re.match(r'^[A-Z]{2}\d{3}[A-Z]{2}$', txt) # AB123CD ACTUALMENTE
+        re.match(r'^[A-Z]{3}\d{3}$', txt) or
+        re.match(r'^[A-Z]{2}\d{3}[A-Z]{2}$', txt)
     )
 
 def aplicar_nitidez_y_clahe(img):
@@ -39,13 +42,15 @@ def aplicar_nitidez_y_clahe(img):
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     return clahe.apply(sharp)
 
-
 def escalar_imagen(img, factor=3.0):
     return cv2.resize(img, None, fx=factor, fy=factor, interpolation=cv2.INTER_CUBIC)
 
 def ocr_paddle_con_confianza(path):
     img = cv2.imread(path)
-    resultado = ocr.ocr(img, cls=True)
+    if img is None:
+        print(f"❌ No se pudo leer la imagen para OCR: {path}")
+        return "", 0.0
+    resultado = ocr.ocr(img)
     posibles = []
     if resultado:
         for linea in resultado:
@@ -63,10 +68,11 @@ def ocr_paddle_con_confianza(path):
         return posibles[0]
     return "", 0.0
 
-# --- FUNCIÓN PARA LA API ---
+# --- FUNCIÓN PRINCIPAL PARA API ---
 async def detect_plate_wrapper(image_bytes: bytes):
-    carpeta_resultados = Path(__file__).resolve().parent.parent / 'resultados'
+    carpeta_resultados = BASE_DIR / 'resultados'
     carpeta_resultados.mkdir(parents=True, exist_ok=True)
+    todos_los_resultados.clear()
 
     arr = np.frombuffer(image_bytes, np.uint8)
     imagen = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -88,61 +94,54 @@ async def detect_plate_wrapper(image_bytes: bytes):
     xyxy = pred[0][:4].cpu().numpy()
     x1, y1, x2, y2 = (xyxy * np.array([w/640, h/640, w/640, h/640])).astype(int)
     patente_recortada = imagen[y1:y2, x1:x2]
-    path_crop = os.path.join(carpeta_resultados, '1_patente_recortada.png')
+    path_crop = str(carpeta_resultados / '1_patente_recortada.png')
     cv2.imwrite(path_crop, patente_recortada)
 
+    # --- Intentos de OCR ---
     def intentar_ocr(img, nombre_archivo):
-        path = os.path.join(carpeta_resultados, nombre_archivo)
+        path = str(carpeta_resultados / nombre_archivo)
         cv2.imwrite(path, img)
         texto, conf = ocr_paddle_con_confianza(path)
         print(f"🔁 OCR {nombre_archivo}: {texto} (conf: {conf:.2f})")
-        todos_los_resultados.append((texto, conf))  # ← guarda aunque no sea válido
+        todos_los_resultados.append((texto, conf))
 
-    # OCR 2: original escalado
     original_esc = escalar_imagen(patente_recortada)
-    resultado = intentar_ocr(original_esc, '2_patente_escalada.png')
-    if resultado:
-        return resultado, patente_recortada
+    intentar_ocr(original_esc, '1a_patente_escalada.png')
 
-    # OCR 3: original escalado + nitidez + clahe
     nitidez_clahe = aplicar_nitidez_y_clahe(original_esc)
-    resultado = intentar_ocr(nitidez_clahe, '3_patente_nitidez_clahe.png')
+    intentar_ocr(nitidez_clahe, '2_patente_nitidez_clahe.png')
 
-    # OCR 4: invertido grises
-    invertidagris = cv2.bitwise_not(cv2.cvtColor(patente_recortada, cv2.COLOR_BGR2GRAY))
-    resultado = intentar_ocr(escalar_imagen(invertidagris), '4_invertida_escalada_gris.png')
+    invertida = cv2.bitwise_not(cv2.cvtColor(patente_recortada, cv2.COLOR_BGR2GRAY))
+    intentar_ocr(escalar_imagen(invertida), '3_invertida_grises.png')
 
-    # OCR 5: warp escalado mejorado con ancho extendido
-    h, w = patente_recortada.shape[:2]
-    pts1 = np.float32([[0, 0], [w - 1, 0], [0, h - 1], [w - 1, h - 1]])
+    h, w = original_esc.shape[:2]
     nuevo_ancho = int(w * 1.5)
     nuevo_alto = h
+    pts1 = np.float32([[0, 0], [w - 1, 0], [0, h - 1], [w - 1, h - 1]])
     pts2 = np.float32([[0, 0], [nuevo_ancho - 1, 0], [0, nuevo_alto - 1], [nuevo_ancho - 1, nuevo_alto - 1]])
     M = cv2.getPerspectiveTransform(pts1, pts2)
-    warp = cv2.warpPerspective(patente_recortada, M, (nuevo_ancho, nuevo_alto))
-    resultado = intentar_ocr(escalar_imagen(warp), '5_warp_escalada.png')
-    
-    # OCR 6: wrap + nitidez + clahe
+    warp = cv2.warpPerspective(original_esc, M, (nuevo_ancho, nuevo_alto))
+    intentar_ocr(escalar_imagen(warp), '3a_warp_escalada.png')
+
     nitidez_clahe_warp = aplicar_nitidez_y_clahe(warp)
-    resultado = intentar_ocr(nitidez_clahe_warp, '6_patente_warp_nitidez_clahe.png')
-    
-    # OCR 7: warp invertida escalada grises
-    warp_inv = cv2.bitwise_not(cv2.cvtColor(warp, cv2.COLOR_BGR2GRAY))
-    resultado = intentar_ocr(escalar_imagen(warp_inv), '7_warp_invertida_escalada_gris.png')
+    intentar_ocr(nitidez_clahe_warp, '4_patente_nitidez_clahe_warp.png')
 
-    if todos_los_resultados:
-        candidatos_validos = [ 
-                              (t, c) for t, c in todos_los_resultados
-                              if re.fullmatch(r'[A-Z]{3}\d{3}', t) or re.fullmatch(r'[A-Z]{2}\d{3}[A-Z]{2}', t)
-        ]
+    warp_inv_gris = cv2.bitwise_not(cv2.cvtColor(warp, cv2.COLOR_BGR2GRAY))
+    intentar_ocr(escalar_imagen(warp_inv_gris), '5_invertida_escalada.png')
 
-        if candidatos_validos:
-            mejor_valido, conf_valido = max(candidatos_validos, key=lambda x: x[1])
-            print(f"✅ Texto detectado válido: {mejor_valido} (conf: {conf_valido:.2f})")
-            return mejor_valido, patente_recortada
-        else:
-            mejor_texto, mejor_conf = max(todos_los_resultados, key=lambda x: x[1])
-            print(f"⚠️ No se detectó una patente con formato válido, pero el mejor intento fue: {mejor_texto} (conf: {mejor_conf:.2f})")
-            return mejor_texto, patente_recortada
+    candidatos_validos = [
+        (t, c) for t, c in todos_los_resultados
+        if re.fullmatch(r'[A-Z]{3}\d{3}', t) or re.fullmatch(r'[A-Z]{2}\d{3}[A-Z]{2}', t)
+    ]
+    if candidatos_validos:
+        mejor_valido, conf_valido = max(candidatos_validos, key=lambda x: x[1])
+        print(f"✅ Texto detectado válido: {mejor_valido} (conf: {conf_valido:.2f})")
+        return mejor_valido, patente_recortada
+    elif todos_los_resultados:
+        mejor_texto, mejor_conf = max(todos_los_resultados, key=lambda x: x[1])
+        print(f"⚠️ No se detectó una patente con formato válido, pero el mejor intento fue: {mejor_texto} (conf: {mejor_conf:.2f})")
+        return mejor_texto, patente_recortada
     else:
-        raise ValueError("⚠️ No se detectó ningún texto.")
+        print("⚠️ No se detectó ningún texto.")
+        return "", patente_recortada
+
