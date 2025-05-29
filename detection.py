@@ -6,6 +6,9 @@ import numpy as np
 import re
 from pathlib import Path
 from paddleocr import PaddleOCR
+from scipy.signal import wiener
+from skimage import exposure, img_as_ubyte
+from skimage.color import rgb2gray
 
 # --- Configurar rutas ---
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -42,15 +45,36 @@ def aplicar_nitidez_y_clahe(img):
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     return clahe.apply(sharp)
 
+def resaltar_letras_negras(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    contraste = clahe.apply(gray)
+    _, binarizada = cv2.threshold(contraste, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    kernel = np.ones((2, 2), np.uint8)
+    reforzada = cv2.dilate(binarizada, kernel, iterations=1)
+    final = cv2.bitwise_not(reforzada)
+    return final
+
+def aplicar_wiener(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    filtrada = wiener(gray)
+    filtrada = np.uint8(np.clip(filtrada, 0, 255))
+    return filtrada
+
+def mejorar_contraste(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    p2, p98 = np.percentile(gray, (2, 98))
+    estirada = exposure.rescale_intensity(gray, in_range=(p2, p98))
+    adapthist = exposure.equalize_adapthist(estirada, clip_limit=0.03)
+    final = img_as_ubyte(adapthist)
+    return final
+
 def escalar_imagen(img, factor=3.0):
     return cv2.resize(img, None, fx=factor, fy=factor, interpolation=cv2.INTER_CUBIC)
 
 def ocr_paddle_con_confianza(path):
     img = cv2.imread(path)
-    if img is None:
-        print(f"❌ No se pudo leer la imagen para OCR: {path}")
-        return "", 0.0
-    resultado = ocr.ocr(img)
+    resultado = ocr.ocr(img, cls=True)
     posibles = []
     if resultado:
         for linea in resultado:
@@ -120,41 +144,45 @@ async def detect_plate_wrapper(image_bytes: bytes):
 
     original_esc = escalar_imagen(patente_recortada)
     intentar_ocr(original_esc, '1a_patente_escalada.png')
+    
+    wiener_filtrada = aplicar_wiener(original_esc)
+    intentar_ocr(wiener_filtrada, '2_patente_wiener.png')
 
     nitidez_clahe = aplicar_nitidez_y_clahe(original_esc)
-    intentar_ocr(nitidez_clahe, '2_patente_nitidez_clahe.png')
+    intentar_ocr(nitidez_clahe, '3_patente_nitidez_clahe.png')
+   
+    original_reforzada = resaltar_letras_negras(original_esc)
+    intentar_ocr(original_reforzada, '4_patente_escalada_reforzada.png')
 
-    invertida = cv2.bitwise_not(cv2.cvtColor(patente_recortada, cv2.COLOR_BGR2GRAY))
-    intentar_ocr(escalar_imagen(invertida), '3_invertida_grises.png')
+    mejorada = mejorar_contraste(original_esc)
+    intentar_ocr(mejorada, '5_patente_mejorada_contraste.png')
+
+    invertida = cv2.bitwise_not(patente_recortada)
+    intentar_ocr(escalar_imagen(invertida), '6_invertida_escalada.png')
 
     h, w = original_esc.shape[:2]
-    nuevo_ancho = int(w * 1.5)
+    nuevo_ancho = int(w * 2)
     nuevo_alto = h
     pts1 = np.float32([[0, 0], [w - 1, 0], [0, h - 1], [w - 1, h - 1]])
     pts2 = np.float32([[0, 0], [nuevo_ancho - 1, 0], [0, nuevo_alto - 1], [nuevo_ancho - 1, nuevo_alto - 1]])
     M = cv2.getPerspectiveTransform(pts1, pts2)
     warp = cv2.warpPerspective(original_esc, M, (nuevo_ancho, nuevo_alto))
-    intentar_ocr(escalar_imagen(warp), '4_warp_escalada.png')
-    
-    #Segundo warp como corrección si el primero sigue torcido
-    h2, w2 = warp.shape[:2]
-    pts1b = np.float32([[0, 0], [w2 - 1, 0], [0, h2 - 1], [w2 - 1, h2 - 1]])
-    pts2b = np.float32([[0, 0], [w2 - 1, 10], [10, h2 - 1], [w2 - 11, h2 - 11]])  # podemos afinar estos valores
-    M2 = cv2.getPerspectiveTransform(pts1b, pts2b)
-    warp2 = cv2.warpPerspective(warp, M2, (w2, h2))
-    intentar_ocr(escalar_imagen(warp2), '4a_warp_refinado.png')
+    intentar_ocr(escalar_imagen(warp), '7_warp_escalada.png')
 
     nitidez_clahe_warp = aplicar_nitidez_y_clahe(warp)
-    intentar_ocr(nitidez_clahe_warp, '5_patente_nitidez_clahe_warp.png')
-    
-    nitidez_clahe_warp = aplicar_nitidez_y_clahe(warp2)
-    intentar_ocr(nitidez_clahe_warp, '5a_patente_nitidez_clahe_warp.png')
+    intentar_ocr(nitidez_clahe_warp, '8_patente_nitidez_clahe_warp.png')
 
-    warp_inv_gris = cv2.bitwise_not(cv2.cvtColor(warp, cv2.COLOR_BGR2GRAY))
-    intentar_ocr(escalar_imagen(warp_inv_gris), '6_invertida_escalada.png')
-    
-    warp_inv_gris = cv2.bitwise_not(cv2.cvtColor(warp2, cv2.COLOR_BGR2GRAY))
-    intentar_ocr(escalar_imagen(warp_inv_gris), '6a_invertida_escalada.png')
+    invertida_warp = cv2.bitwise_not(warp)
+    intentar_ocr(escalar_imagen(invertida_warp), '9_invertida_escalada_warp.png')
+
+    original_reforzada_warp = resaltar_letras_negras(warp)
+    intentar_ocr(original_reforzada_warp, '10_patente_escalada_reforzada.png')
+
+    wiener_filtrada_warp = aplicar_wiener(warp)
+    intentar_ocr(wiener_filtrada_warp, '11_patente_wiener.png')
+
+    mejorada_warp = mejorar_contraste(warp)
+    intentar_ocr(mejorada_warp, '12_patente_mejorada_contraste.png')  
 
     candidatos_validos = [
         (t, c) for t, c in todos_los_resultados
