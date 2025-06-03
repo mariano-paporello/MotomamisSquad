@@ -69,6 +69,15 @@ def mejorar_contraste(img):
     final = img_as_ubyte(adapthist)
     return final
 
+def preprocesar(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    cl = clahe.apply(gray)
+    _, binarizada = cv2.threshold(cl, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(binarizada) < 127:
+        binarizada = cv2.bitwise_not(binarizada)
+    return binarizada
+
 def escalar_imagen(img, factor=3.0):
     return cv2.resize(img, None, fx=factor, fy=factor, interpolation=cv2.INTER_CUBIC)
 
@@ -159,30 +168,38 @@ async def detect_plate_wrapper(image_bytes: bytes):
 
     invertida = cv2.bitwise_not(patente_recortada)
     intentar_ocr(escalar_imagen(invertida), '6_invertida_escalada.png')
+    
+    # OCR 7: preprocesada escalada
+    preproc = preprocesar(patente_recortada)
+    intentar_ocr(escalar_imagen(preproc), '7_preproc_escalada.png')
 
     h, w = original_esc.shape[:2]
     nuevo_ancho = int(w * 2)
     nuevo_alto = h
     pts1 = np.float32([[0, 0], [w - 1, 0], [0, h - 1], [w - 1, h - 1]])
-    pts2 = np.float32([[0, 0], [nuevo_ancho - 1, 0], [0, nuevo_alto - 1], [nuevo_ancho - 1, nuevo_alto - 1]])
+    pts2 = np.float32([[0, 0], [nuevo_ancho - 6, 0], [0, nuevo_alto - 6], [nuevo_ancho - 4, nuevo_alto - 5]])
     M = cv2.getPerspectiveTransform(pts1, pts2)
     warp = cv2.warpPerspective(original_esc, M, (nuevo_ancho, nuevo_alto))
-    intentar_ocr(escalar_imagen(warp), '7_warp_escalada.png')
+    intentar_ocr(escalar_imagen(warp), '8_warp_escalada.png')
 
     nitidez_clahe_warp = aplicar_nitidez_y_clahe(warp)
-    intentar_ocr(nitidez_clahe_warp, '8_patente_nitidez_clahe_warp.png')
+    intentar_ocr(nitidez_clahe_warp, '9_patente_nitidez_clahe_warp.png')
 
     invertida_warp = cv2.bitwise_not(warp)
-    intentar_ocr(escalar_imagen(invertida_warp), '9_invertida_escalada_warp.png')
+    intentar_ocr(escalar_imagen(invertida_warp), '10_invertida_escalada_warp.png')
 
     original_reforzada_warp = resaltar_letras_negras(warp)
-    intentar_ocr(original_reforzada_warp, '10_patente_escalada_reforzada.png')
+    intentar_ocr(original_reforzada_warp, '11_patente_escalada_reforzada.png')
 
     wiener_filtrada_warp = aplicar_wiener(warp)
-    intentar_ocr(wiener_filtrada_warp, '11_patente_wiener.png')
+    intentar_ocr(wiener_filtrada_warp, '12_patente_wiener.png')
 
     mejorada_warp = mejorar_contraste(warp)
-    intentar_ocr(mejorada_warp, '12_patente_mejorada_contraste.png')  
+    intentar_ocr(mejorada_warp, '13_patente_mejorada_contraste.png')  
+    
+    # OCR 13: preprocesada escalada
+    preproc_warp = preprocesar(warp)
+    intentar_ocr(escalar_imagen(preproc_warp), '14_preproc_escalada.png')
 
     candidatos_validos = [
         (t, c) for t, c in todos_los_resultados
