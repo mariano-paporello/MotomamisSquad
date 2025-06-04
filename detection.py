@@ -114,6 +114,34 @@ def corregir_patente_por_formato(texto):
         return letras + numeros
     return texto
 
+def recorte_por_proyecciones_img(img: np.ndarray) -> np.ndarray:
+    gris = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    mejorada = clahe.apply(gris)
+
+    kernel_prewitt_v = np.array([[1, 0, -1],
+                                  [1, 0, -1],
+                                  [1, 0, -1]])
+    bordes = cv2.filter2D(mejorada, -1, kernel_prewitt_v)
+    kernel_vertical = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5))
+    apertura = cv2.morphologyEx(bordes, cv2.MORPH_OPEN, kernel_vertical)
+
+    proy_h = np.sum(apertura, axis=1)
+    umbral_h = 0.2 * np.max(proy_h)
+    filas_validas = np.where(proy_h > umbral_h)[0]
+
+    proy_v = np.sum(apertura, axis=0)
+    umbral_v = 0.2 * np.max(proy_v)
+    columnas_validas = np.where(proy_v > umbral_v)[0]
+
+    if len(filas_validas) > 0 and len(columnas_validas) > 0:
+        ymin, ymax = filas_validas[0], filas_validas[-1]
+        xmin, xmax = columnas_validas[0], columnas_validas[-1]
+        return img[ymin:ymax, xmin:xmax]
+    else:
+        print("⚠️ No se pudo detectar una zona clara con caracteres.")
+        return img
+
 # --- FUNCIÓN PRINCIPAL PARA API ---
 async def detect_plate_wrapper(image_bytes: bytes):
     carpeta_resultados = BASE_DIR / 'resultados'
@@ -154,32 +182,38 @@ async def detect_plate_wrapper(image_bytes: bytes):
     original_esc = escalar_imagen(patente_recortada)
     intentar_ocr(original_esc, '1a_patente_escalada.png')
     
-    wiener_filtrada = aplicar_wiener(original_esc)
+    # Aplicar proyecciones sobre original escalado
+    recortada_xy = recorte_por_proyecciones_img(original_esc)
+    path_xy = carpeta_resultados / '1b_patente_recorte_xy.png'
+    cv2.imwrite(str(path_xy), recortada_xy)
+    intentar_ocr(recortada_xy, '1b_patente_recorte_xy.png')
+
+    wiener_filtrada = aplicar_wiener(recortada_xy)
     intentar_ocr(wiener_filtrada, '2_patente_wiener.png')
 
-    nitidez_clahe = aplicar_nitidez_y_clahe(original_esc)
+    nitidez_clahe = aplicar_nitidez_y_clahe(recortada_xy)
     intentar_ocr(nitidez_clahe, '3_patente_nitidez_clahe.png')
    
-    original_reforzada = resaltar_letras_negras(original_esc)
+    original_reforzada = resaltar_letras_negras(recortada_xy)
     intentar_ocr(original_reforzada, '4_patente_escalada_reforzada.png')
 
-    mejorada = mejorar_contraste(original_esc)
+    mejorada = mejorar_contraste(recortada_xy)
     intentar_ocr(mejorada, '5_patente_mejorada_contraste.png')
 
-    invertida = cv2.bitwise_not(patente_recortada)
+    invertida = cv2.bitwise_not(recortada_xy)
     intentar_ocr(escalar_imagen(invertida), '6_invertida_escalada.png')
     
     # OCR 7: preprocesada escalada
-    preproc = preprocesar(patente_recortada)
+    preproc = preprocesar(recortada_xy)
     intentar_ocr(escalar_imagen(preproc), '7_preproc_escalada.png')
 
-    h, w = original_esc.shape[:2]
+    h, w = recortada_xy.shape[:2]
     nuevo_ancho = int(w * 2)
     nuevo_alto = h
-    pts1 = np.float32([[0, 0], [w - 1, 0], [0, h - 1], [w - 1, h - 1]])
-    pts2 = np.float32([[0, 0], [nuevo_ancho - 6, 0], [0, nuevo_alto - 6], [nuevo_ancho - 4, nuevo_alto - 5]])
+    pts1 = np.float32([[0, 0], [w - 4, 6], [0, h - 8], [w - 2, h - 6]])
+    pts2 = np.float32([[0, 0], [nuevo_ancho - 6, 0], [0, nuevo_alto - 8], [nuevo_ancho - 4, nuevo_alto - 6]])
     M = cv2.getPerspectiveTransform(pts1, pts2)
-    warp = cv2.warpPerspective(original_esc, M, (nuevo_ancho, nuevo_alto))
+    warp = cv2.warpPerspective(recortada_xy, M, (nuevo_ancho, nuevo_alto))
     intentar_ocr(escalar_imagen(warp), '8_warp_escalada.png')
 
     nitidez_clahe_warp = aplicar_nitidez_y_clahe(warp)
