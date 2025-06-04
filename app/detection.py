@@ -6,6 +6,9 @@ import numpy as np
 import re
 from pathlib import Path
 from paddleocr import PaddleOCR
+from scipy.signal import wiener
+from skimage import exposure, img_as_ubyte
+from skimage.color import rgb2gray
 
 # --- Configurar rutas ---
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -42,15 +45,45 @@ def aplicar_nitidez_y_clahe(img):
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     return clahe.apply(sharp)
 
+def resaltar_letras_negras(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    contraste = clahe.apply(gray)
+    _, binarizada = cv2.threshold(contraste, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    kernel = np.ones((2, 2), np.uint8)
+    reforzada = cv2.dilate(binarizada, kernel, iterations=1)
+    final = cv2.bitwise_not(reforzada)
+    return final
+
+def aplicar_wiener(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    filtrada = wiener(gray)
+    filtrada = np.uint8(np.clip(filtrada, 0, 255))
+    return filtrada
+
+def mejorar_contraste(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    p2, p98 = np.percentile(gray, (2, 98))
+    estirada = exposure.rescale_intensity(gray, in_range=(p2, p98))
+    adapthist = exposure.equalize_adapthist(estirada, clip_limit=0.03)
+    final = img_as_ubyte(adapthist)
+    return final
+
+def preprocesar(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    cl = clahe.apply(gray)
+    _, binarizada = cv2.threshold(cl, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(binarizada) < 127:
+        binarizada = cv2.bitwise_not(binarizada)
+    return binarizada
+
 def escalar_imagen(img, factor=3.0):
     return cv2.resize(img, None, fx=factor, fy=factor, interpolation=cv2.INTER_CUBIC)
 
 def ocr_paddle_con_confianza(path):
     img = cv2.imread(path)
-    if img is None:
-        print(f"❌ No se pudo leer la imagen para OCR: {path}")
-        return "", 0.0
-    resultado = ocr.ocr(img)
+    resultado = ocr.ocr(img, cls=True)
     posibles = []
     if resultado:
         for linea in resultado:
@@ -67,6 +100,47 @@ def ocr_paddle_con_confianza(path):
     if posibles:
         return posibles[0]
     return "", 0.0
+
+def corregir_patente_por_formato(texto):
+    texto = texto.upper().replace(" ", "").replace("\n", "")
+    if re.fullmatch(r'[A-Z0-9]{2}[A-Z0-9]{3}[A-Z0-9]{2}', texto):
+        letras1 = texto[:2].replace("1", "I").replace("0", "O").replace("4", "A").replace("8", "B").replace("5", "S").replace("6", "G")
+        numeros = texto[2:5].replace("I", "1").replace("O", "0").replace("S", "5").replace("A", "4").replace("B", "8")
+        letras2 = texto[5:].replace("1", "I").replace("0", "O").replace("S", "5").replace("A", "4").replace("B", "8").replace("6", "G")
+        return letras1 + numeros + letras2
+    if re.fullmatch(r'[A-Z0-9]{3}[A-Z0-9]{3}', texto):
+        letras = texto[:3].replace("1", "I").replace("0", "O").replace("4", "A").replace("8", "B").replace("5", "S").replace("6", "G")
+        numeros = texto[3:].replace("I", "1").replace("O", "0").replace("S", "5").replace("A", "4").replace("B", "8")
+        return letras + numeros
+    return texto
+
+def recorte_por_proyecciones_img(img: np.ndarray) -> np.ndarray:
+    gris = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    mejorada = clahe.apply(gris)
+
+    kernel_prewitt_v = np.array([[1, 0, -1],
+                                  [1, 0, -1],
+                                  [1, 0, -1]])
+    bordes = cv2.filter2D(mejorada, -1, kernel_prewitt_v)
+    kernel_vertical = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5))
+    apertura = cv2.morphologyEx(bordes, cv2.MORPH_OPEN, kernel_vertical)
+
+    proy_h = np.sum(apertura, axis=1)
+    umbral_h = 0.2 * np.max(proy_h)
+    filas_validas = np.where(proy_h > umbral_h)[0]
+
+    proy_v = np.sum(apertura, axis=0)
+    umbral_v = 0.2 * np.max(proy_v)
+    columnas_validas = np.where(proy_v > umbral_v)[0]
+
+    if len(filas_validas) > 0 and len(columnas_validas) > 0:
+        ymin, ymax = filas_validas[0], filas_validas[-1]
+        xmin, xmax = columnas_validas[0], columnas_validas[-1]
+        return img[ymin:ymax, xmin:xmax]
+    else:
+        print("⚠️ No se pudo detectar una zona clara con caracteres.")
+        return img
 
 # --- FUNCIÓN PRINCIPAL PARA API ---
 async def detect_plate_wrapper(image_bytes: bytes):
@@ -107,27 +181,59 @@ async def detect_plate_wrapper(image_bytes: bytes):
 
     original_esc = escalar_imagen(patente_recortada)
     intentar_ocr(original_esc, '1a_patente_escalada.png')
+    
+    # Aplicar proyecciones sobre original escalado
+    recortada_xy = recorte_por_proyecciones_img(original_esc)
+    path_xy = carpeta_resultados / '1b_patente_recorte_xy.png'
+    cv2.imwrite(str(path_xy), recortada_xy)
+    intentar_ocr(recortada_xy, '1b_patente_recorte_xy.png')
 
-    nitidez_clahe = aplicar_nitidez_y_clahe(original_esc)
-    intentar_ocr(nitidez_clahe, '2_patente_nitidez_clahe.png')
+    wiener_filtrada = aplicar_wiener(recortada_xy)
+    intentar_ocr(wiener_filtrada, '2_patente_wiener.png')
 
-    invertida = cv2.bitwise_not(cv2.cvtColor(patente_recortada, cv2.COLOR_BGR2GRAY))
-    intentar_ocr(escalar_imagen(invertida), '3_invertida_grises.png')
+    nitidez_clahe = aplicar_nitidez_y_clahe(recortada_xy)
+    intentar_ocr(nitidez_clahe, '3_patente_nitidez_clahe.png')
+   
+    original_reforzada = resaltar_letras_negras(recortada_xy)
+    intentar_ocr(original_reforzada, '4_patente_escalada_reforzada.png')
 
-    h, w = original_esc.shape[:2]
-    nuevo_ancho = int(w * 1.5)
+    mejorada = mejorar_contraste(recortada_xy)
+    intentar_ocr(mejorada, '5_patente_mejorada_contraste.png')
+
+    invertida = cv2.bitwise_not(recortada_xy)
+    intentar_ocr(escalar_imagen(invertida), '6_invertida_escalada.png')
+    
+    # OCR 7: preprocesada escalada
+    preproc = preprocesar(recortada_xy)
+    intentar_ocr(escalar_imagen(preproc), '7_preproc_escalada.png')
+
+    h, w = recortada_xy.shape[:2]
+    nuevo_ancho = int(w * 2)
     nuevo_alto = h
-    pts1 = np.float32([[0, 0], [w - 1, 0], [0, h - 1], [w - 1, h - 1]])
-    pts2 = np.float32([[0, 0], [nuevo_ancho - 1, 0], [0, nuevo_alto - 1], [nuevo_ancho - 1, nuevo_alto - 1]])
+    pts1 = np.float32([[0, 0], [w - 4, 6], [0, h - 8], [w - 2, h - 6]])
+    pts2 = np.float32([[0, 0], [nuevo_ancho - 6, 0], [0, nuevo_alto - 8], [nuevo_ancho - 4, nuevo_alto - 6]])
     M = cv2.getPerspectiveTransform(pts1, pts2)
-    warp = cv2.warpPerspective(original_esc, M, (nuevo_ancho, nuevo_alto))
-    intentar_ocr(escalar_imagen(warp), '3a_warp_escalada.png')
+    warp = cv2.warpPerspective(recortada_xy, M, (nuevo_ancho, nuevo_alto))
+    intentar_ocr(escalar_imagen(warp), '8_warp_escalada.png')
 
     nitidez_clahe_warp = aplicar_nitidez_y_clahe(warp)
-    intentar_ocr(nitidez_clahe_warp, '4_patente_nitidez_clahe_warp.png')
+    intentar_ocr(nitidez_clahe_warp, '9_patente_nitidez_clahe_warp.png')
 
-    warp_inv_gris = cv2.bitwise_not(cv2.cvtColor(warp, cv2.COLOR_BGR2GRAY))
-    intentar_ocr(escalar_imagen(warp_inv_gris), '5_invertida_escalada.png')
+    invertida_warp = cv2.bitwise_not(warp)
+    intentar_ocr(escalar_imagen(invertida_warp), '10_invertida_escalada_warp.png')
+
+    original_reforzada_warp = resaltar_letras_negras(warp)
+    intentar_ocr(original_reforzada_warp, '11_patente_escalada_reforzada.png')
+
+    wiener_filtrada_warp = aplicar_wiener(warp)
+    intentar_ocr(wiener_filtrada_warp, '12_patente_wiener.png')
+
+    mejorada_warp = mejorar_contraste(warp)
+    intentar_ocr(mejorada_warp, '13_patente_mejorada_contraste.png')  
+    
+    # OCR 13: preprocesada escalada
+    preproc_warp = preprocesar(warp)
+    intentar_ocr(escalar_imagen(preproc_warp), '14_preproc_escalada.png')
 
     candidatos_validos = [
         (t, c) for t, c in todos_los_resultados
@@ -135,13 +241,13 @@ async def detect_plate_wrapper(image_bytes: bytes):
     ]
     if candidatos_validos:
         mejor_valido, conf_valido = max(candidatos_validos, key=lambda x: x[1])
-        print(f"✅ Texto detectado válido: {mejor_valido} (conf: {conf_valido:.2f})")
-        return mejor_valido, patente_recortada
+        mensaje = f"✅ Patente detectada: {mejor_valido} (conf: {conf_valido:.2f})"
+        return mensaje, patente_recortada
     elif todos_los_resultados:
         mejor_texto, mejor_conf = max(todos_los_resultados, key=lambda x: x[1])
-        print(f"⚠️ No se detectó una patente con formato válido, pero el mejor intento fue: {mejor_texto} (conf: {mejor_conf:.2f})")
-        return mejor_texto, patente_recortada
+        corregido = corregir_patente_por_formato(mejor_texto)
+        mensaje = f"⚠️ No se detectó una patente con formato válido, pero el mejor intento fue: {corregido} (conf: {mejor_conf:.2f})"
+        return mensaje, patente_recortada
     else:
         print("⚠️ No se detectó ningún texto.")
         return "", patente_recortada
-
