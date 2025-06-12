@@ -53,6 +53,16 @@ class ImagePreprocessor:
     def reset(self):
         self.image = self.original.copy()
         return self
+    
+    def clahe_binarized_scaled(self):
+        gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        cl = clahe.apply(gray)
+        _, binary = cv2.threshold(cl, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        scaled = cv2.resize(binary, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+        self.image = scaled
+        return self
+
 
     def enhance_sharpness_and_clahe(self):
         gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
@@ -147,51 +157,68 @@ class PlateDetector:
                         candidates.append((formatted, confidence))
         return max(candidates, key=lambda x: x[1], default=("", 0.0))
 
-
     async def detect_from_bytes(self, image_bytes: bytes) -> tuple[str, np.ndarray]:
         output_dir = BASE_DIR / 'results'
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Leer imagen
         image = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
         if image is None:
             raise ValueError("Invalid image data.")
 
+        # Preprocesamiento adaptativo para mejorar detección
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        cl = clahe.apply(l)
+        merged = cv2.merge((cl, a, b))
+        enhanced_image = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+
+        # Redimensionar imagen para detector
         h, w = image.shape[:2]
-        resized = cv2.resize(image, (640, 640))
+        resized = cv2.resize(enhanced_image, (640, 640))
         tensor = torch.from_numpy(resized).permute(2, 0, 1).float().div(255).unsqueeze(0).to(device)
 
+        # Ejecutar detección
         with torch.no_grad():
             predictions = detection_model(tensor)[0]
             predictions = non_max_suppression(predictions, conf_thres=0.25, iou_thres=0.45)[0]
 
-        if predictions is None or len(predictions) == 0:
-            raise ValueError("No license plate detected.")
+        # Si hay detección, usar esa región
+        if predictions is not None and len(predictions) > 0:
+            coords = predictions[0][:4].cpu().numpy()
+            x1, y1, x2, y2 = (coords * np.array([w/640, h/640, w/640, h/640])).astype(int)
 
-        coords = predictions[0][:4].cpu().numpy()
-        x1, y1, x2, y2 = (coords * np.array([w/640, h/640, w/640, h/640])).astype(int)
-        cropped_plate = image[y1:y2, x1:x2]
-        
-        processor = ImagePreprocessor(cropped_plate)
-        transformations = [
-            (processor.reset().scale_image().get_image(), 'scaled.png'),
-            (processor.reset().scale_image().crop_by_projections().get_image(), 'cropped.png'),
-            (processor.reset().apply_wiener_filter().get_image(), 'wiener.png'),
-            (processor.reset().enhance_sharpness_and_clahe().get_image(), 'sharp_clahe.png'),
-            (processor.reset().enhance_black_letters().get_image(), 'black_letters.png'),
-            (processor.reset().improve_contrast().get_image(), 'contrast.png'),
-            (processor.reset().scale_image().get_image()[..., ::-1], 'inverted.png'),
-            (processor.reset().preprocess_basic().scale_image().get_image(), 'preproc.png'),
-        ]
+            cropped_plate = image[y1:y2, x1:x2]
+            cv2.imwrite(str(output_dir / "debug_raw_plate.png"), cropped_plate)
+            raw_ocr_result = self.run_ocr(cropped_plate, output_dir / "raw_ocr.png")
+            self.results.append(raw_ocr_result)
+            print(f"🧪 Raw OCR: {raw_ocr_result[0]} (conf: {raw_ocr_result[1]:.2f})")
 
-        for img, name in transformations:
-            result = self.run_ocr(img, output_dir / name)
-            self.results.append(result)
+            processor = ImagePreprocessor(cropped_plate)
+            transformations = [
+                (processor.reset().scale_image().get_image(), 'scaled.png'),
+                (processor.reset().apply_wiener_filter().get_image(), 'wiener.png'),
+                (processor.reset().enhance_sharpness_and_clahe().get_image(), 'sharp_clahe.png'),
+                (processor.reset().enhance_black_letters().get_image(), 'black_letters.png'),
+                (processor.reset().improve_contrast().get_image(), 'contrast.png'),
+                (processor.reset().preprocess_basic().scale_image().get_image(), 'preproc.png'),
+            ]
 
-        valid = [r for r in self.results if PlateTextProcessor.is_valid_plate(r[0])]
-        if valid:
-            best, conf = max(valid, key=lambda x: x[1])
-            return f"License plate: {best} (conf: {conf:.2f})", cropped_plate
+            for img, name in transformations:
+                result = self.run_ocr(img, output_dir / name)
+                self.results.append(result)
 
-        best_guess, conf = max(self.results, key=lambda x: x[1], default=("", 0.0))
-        corrected = PlateTextProcessor.format_text_like_plate(best_guess)
-        return f"Uncertain: best guess is {corrected} (conf: {conf:.2f})", cropped_plate
+            valid = [r for r in self.results if PlateTextProcessor.is_valid_plate(r[0])]
+            if valid:
+                best, conf = max(valid, key=lambda x: x[1])
+                return f"License plate: {best} (conf: {conf:.2f})", cropped_plate
+
+        # Fallback: usar OCR en imagen completa si no hubo detección
+        print("⚠️ No plate detected by model. Trying full image OCR fallback...")
+        preprocessed = ImagePreprocessor(image).enhance_sharpness_and_clahe().scale_image().get_image()
+        full_ocr_result = self.run_ocr(preprocessed, output_dir / "fallback_full_ocr.png")
+        if PlateTextProcessor.is_valid_plate(full_ocr_result[0]):
+            return f"Fallback plate: {full_ocr_result[0]} (conf: {full_ocr_result[1]:.2f})", image
+
+        return f"Uncertain: best guess is {full_ocr_result[0]} (conf: {full_ocr_result[1]:.2f})", image
