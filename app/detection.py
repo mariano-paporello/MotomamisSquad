@@ -193,7 +193,7 @@ class PlateDetector:
             cv2.imwrite(str(output_dir / "debug_raw_plate.png"), cropped_plate)
             raw_ocr_result = self.run_ocr(cropped_plate, output_dir / "raw_ocr.png")
             self.results.append(raw_ocr_result)
-            print(f"🧪 Raw OCR: {raw_ocr_result[0]} (conf: {raw_ocr_result[1]:.2f})")
+            print(f"Raw OCR: {raw_ocr_result[0]} (conf: {raw_ocr_result[1]:.2f})")
 
             processor = ImagePreprocessor(cropped_plate)
             transformations = [
@@ -215,10 +215,11 @@ class PlateDetector:
                 return f"License plate: {best} (conf: {conf:.2f})", cropped_plate
 
         # Fallback: usar OCR en imagen completa si no hubo detección
-        print("⚠️ No plate detected by model. Trying full image OCR fallback...")
+        print("No plate detected by model. Trying full image OCR fallback...")
         preprocessed = ImagePreprocessor(image).enhance_sharpness_and_clahe().scale_image().get_image()
         full_ocr_result = self.run_ocr(preprocessed, output_dir / "fallback_full_ocr.png")
         if PlateTextProcessor.is_valid_plate(full_ocr_result[0]):
             return f"Fallback plate: {full_ocr_result[0]} (conf: {full_ocr_result[1]:.2f})", image
 
-        return f"Uncertain: best guess is {full_ocr_result[0]} (conf: {full_ocr_result[1]:.2f})", image
+        print("No valid license plate detected.")
+        return "No license plate detected.", image
