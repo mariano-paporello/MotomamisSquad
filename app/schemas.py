@@ -1,5 +1,6 @@
 from pydantic import BaseModel
+from typing import List
 
 class PlateResponse(BaseModel):
-    plate: str          # Texto de la matrícula detectada
-    image: str          # Imagen recortada en base64 (data URI)
+    plate: List[str]  # ← Antes era solo "str"
+    image: str        # Base64 de la imagen recortada
